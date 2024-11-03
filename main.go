@@ -68,10 +68,11 @@ func main() {
 	defer pool.Close()
 	errorChan := make(chan Result, 1)
 
-	wg.Add(3)
+	wg.Add(4)
 	go fetchWithCursor(ctx, errorChan)
 	go fetchWithOffsetLimit(ctx, errorChan)
 	go fetchWithCustomCursor(ctx, errorChan)
+	go fetchWithCopy(ctx, errorChan)
 
 	go func() {
 		wg.Wait()
@@ -82,7 +83,7 @@ func main() {
 		if result.Err != nil {
 			fmt.Println(result.Err)
 		} else {
-			fmt.Println(result.Message)
+			fmt.Printf("%s done in %s, saved to output/%s.csv\n", result.Type, result.Message, result.Type)
 		}
 	}
 }
@@ -95,7 +96,7 @@ func fetchWithCursor(ctx context.Context, res chan<- Result) error {
 	}
 
 	// Create or open the CSV file
-	file, err := os.Create("./output/cursor.csv")
+	file, err := os.Create(fmt.Sprintf("./output/%s.csv", result.Type))
 	if err != nil {
 		err = fmt.Errorf("error creating file: %v", err)
 		result.Err = err
@@ -150,6 +151,14 @@ func fetchWithCursor(ctx context.Context, res chan<- Result) error {
 			break
 		}
 
+		header := []string{"aid", "bid", "abalance"}
+		if err := writer.Write(header); err != nil {
+			err = fmt.Errorf("error writing record to CSV: %v", err)
+			result.Err = err
+			res <- result
+			return err
+		}
+
 		// Process each row in the batch
 		for rows.Next() {
 			var aid, bid, abalance int
@@ -202,7 +211,7 @@ func fetchWithCursor(ctx context.Context, res chan<- Result) error {
 	end := time.Now()
 	duration := end.Sub(start)
 
-	result.Message = fmt.Sprintf("cursor done in %.2f second", duration.Seconds())
+	result.Message = fmt.Sprintf("%.2f second", duration.Seconds())
 	res <- result
 
 	return commit
@@ -216,7 +225,7 @@ func fetchWithCustomCursor(ctx context.Context, res chan<- Result) error {
 	}
 
 	// Create or open the CSV file
-	file, err := os.Create("./output/custom_cursor.csv")
+	file, err := os.Create(fmt.Sprintf("./output/%s.csv", result.Type))
 	if err != nil {
 		err = fmt.Errorf("error creating file: %v", err)
 		result.Err = err
@@ -227,6 +236,14 @@ func fetchWithCustomCursor(ctx context.Context, res chan<- Result) error {
 
 	writer := csv.NewWriter(file)
 	defer writer.Flush() // Ensure data is written to file
+
+	header := []string{"aid", "bid", "abalance"}
+	if err := writer.Write(header); err != nil {
+		err = fmt.Errorf("error writing record to CSV: %v", err)
+		result.Err = err
+		res <- result
+		return err
+	}
 
 	var lastId int
 	for {
@@ -272,7 +289,7 @@ func fetchWithCustomCursor(ctx context.Context, res chan<- Result) error {
 			}
 
 			if err := writer.Write(record); err != nil {
-				err = fmt.Errorf("error writing record to CSV: %v\n", err)
+				err = fmt.Errorf("error writing record to CSV: %v", err)
 				result.Err = err
 				res <- result
 				return err
@@ -294,7 +311,7 @@ func fetchWithCustomCursor(ctx context.Context, res chan<- Result) error {
 	end := time.Now()
 	duration := end.Sub(start)
 
-	result.Message = fmt.Sprintf("custom cursor done in %.2f second", duration.Seconds())
+	result.Message = fmt.Sprintf("%.2f second", duration.Seconds())
 	res <- result
 
 	return nil
@@ -308,7 +325,7 @@ func fetchWithOffsetLimit(ctx context.Context, res chan<- Result) error {
 	}
 
 	// Create or open the CSV file
-	file, err := os.Create("./output/offset_limit.csv")
+	file, err := os.Create(fmt.Sprintf("./output/%s.csv", result.Type))
 	if err != nil {
 		err = fmt.Errorf("error creating file: %v", err)
 		result.Err = err
@@ -320,9 +337,16 @@ func fetchWithOffsetLimit(ctx context.Context, res chan<- Result) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush() // Ensure data is written to file
 
+	header := []string{"aid", "bid", "abalance"}
+	if err := writer.Write(header); err != nil {
+		err = fmt.Errorf("error writing record to CSV: %v", err)
+		result.Err = err
+		res <- result
+		return err
+	}
+
 	// Set the batch size and initialize the offset
 	offset := 0
-
 	for {
 		// Construct the query with limit and offset
 		query := fmt.Sprintf(`
@@ -366,7 +390,7 @@ func fetchWithOffsetLimit(ctx context.Context, res chan<- Result) error {
 			}
 
 			if err := writer.Write(record); err != nil {
-				fmt.Errorf("error writing record to CSV: %v\n", err)
+				err = fmt.Errorf("error writing record to CSV: %v", err)
 				result.Err = err
 				res <- result
 				return err
@@ -388,7 +412,53 @@ func fetchWithOffsetLimit(ctx context.Context, res chan<- Result) error {
 
 	end := time.Now()
 	duration := end.Sub(start)
-	result.Message = fmt.Sprintf("offset limit done in %.2f second", duration.Seconds())
+	result.Message = fmt.Sprintf("%.2f second", duration.Seconds())
+	res <- result
+
+	return nil
+}
+
+func fetchWithCopy(ctx context.Context, res chan<- Result) error {
+	defer wg.Done()
+	start := time.Now()
+	result := Result{
+		Type: "copy",
+	}
+
+	// Create or open the CSV file
+	file, err := os.Create(fmt.Sprintf("./output/%s.csv", result.Type))
+	if err != nil {
+		err = fmt.Errorf("error creating file: %v", err)
+		result.Err = err
+		res <- result
+		return err
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush() // Ensure data is written to file
+
+	conn, err := pool.Acquire(context.Background())
+	if err != nil {
+		result.Err = err
+		res <- result
+		return err
+	}
+	defer conn.Release()
+
+	command := fmt.Sprintf(`COPY (SELECT aid, bid, abalance FROM pgbench_accounts WHERE aid <= %d ORDER BY aid ASC) TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER ',')`, limit)
+	_, err = conn.Conn().PgConn().CopyTo(ctx, file, command)
+	if err != nil {
+		err = fmt.Errorf("failed to init conn: %w", err)
+		result.Err = err
+		res <- result
+		return err
+	}
+
+	end := time.Now()
+	duration := end.Sub(start)
+
+	result.Message = fmt.Sprintf("%.2f second", duration.Seconds())
 	res <- result
 
 	return nil
